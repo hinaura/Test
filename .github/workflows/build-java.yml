@@ -107,7 +107,29 @@ jobs:
           echo "TMPDIR=$BIG_WORKSPACE/tmp" >> "$GITHUB_ENV"
 
       # ------------------------------------------------------------
-      # 4. Android SDK. NDK здесь НЕ устанавливается — сознательно.
+      # 4. Переносим Android SDK на большой смонтированный том
+      #    (по той же причине, что и в build-native.yml — по
+      #    умолчанию SDK лежит вне $GITHUB_WORKSPACE).
+      # ------------------------------------------------------------
+      - name: Relocate Android SDK onto big volume
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OLD_SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          NEW_SDK="$GITHUB_WORKSPACE/.android-sdk"
+
+          mkdir -p "$NEW_SDK"
+          sudo rsync -a --remove-source-files "$OLD_SDK"/ "$NEW_SDK"/
+          sudo rm -rf "$OLD_SDK"
+
+          echo "ANDROID_HOME=$NEW_SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$NEW_SDK" >> "$GITHUB_ENV"
+          echo "$NEW_SDK/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$NEW_SDK/platform-tools" >> "$GITHUB_PATH"
+
+      # ------------------------------------------------------------
+      # 5. Android SDK. NDK здесь НЕ устанавливается — сознательно.
       # ------------------------------------------------------------
       - name: Install Android SDK (no NDK)
         shell: bash
