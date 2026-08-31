@@ -331,25 +331,70 @@ jobs:
             2>/dev/null | head -n 300 || true
 
       # ------------------------------------------------------------
-      # 11. Сборка APK — NDK физически отсутствует на раннере,
-      #     так что externalNativeBuild таска гарантированно не
-      #     запустится (упадёт, если Gradle всё же попытается).
+      # 11. Отключаем CMake как систему сборки нативки СОВСЕМ.
+      #
+      #     `-x externalNativeBuildDebug` не работает: AGP создаёт
+      #     для CMake отдельные задачи configureCMakeDebug[abi] /
+      #     buildCMakeDebug[abi][target], от которых mergeDebugNativeLibs
+      #     зависит НАПРЯМУЮ, а не только через зонтичную задачу
+      #     externalNativeBuildDebug. Исключение зонтичной задачи их не
+      #     убирает — ubuntu-latest тащит preinstalled NDK (или AGP сам
+      #     докачивает его через принятые на шаге 9 лицензии), поэтому
+      #     Gradle тихо пересобирает нативку прямо здесь и подменяет
+      #     проверенный prebuilt .so из jniLibs. Именно это и валило
+      #     шаг "Confirm no native rebuild happened".
+      #
+      #     Вместо точечных -x (хрупко: имя buildCMakeDebug[...] зависит
+      #     от ABI/target и versionCode) убираем сам блок
+      #     android.externalNativeBuild.cmake.path в build.gradle —
+      #     без него AGP вообще не регистрирует CMake-таски.
+      # ------------------------------------------------------------
+      - name: Disable native CMake build (use prebuilt .so only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/disable_cmake.py <<'PY'
+          import re
+          from pathlib import Path
+
+          p = Path("TMessagesProj/build.gradle")
+          text = p.read_text()
+
+          # Only the externalNativeBuild{cmake{...}} block that sets `path`
+          # actually registers jni/CMakeLists.txt with AGP and causes
+          # configureCMake*/buildCMake* tasks to be created. There is a
+          # separate externalNativeBuild{cmake{version...; arguments...}}
+          # block inside defaultConfig — that one is harmless without the
+          # `path` block above and is left untouched.
+          pattern = re.compile(
+              r"externalNativeBuild\s*\{\s*cmake\s*\{\s*path[^}]*\}\s*\}\s*"
+          )
+          new_text, count = pattern.subn("", text, count=1)
+
+          if count != 1:
+              raise SystemExit(
+                  "ERROR: could not find externalNativeBuild{cmake{path...}} "
+                  "block in TMessagesProj/build.gradle -- Telegram's build "
+                  "script layout changed, update this step"
+              )
+
+          p.write_text(new_text)
+          print("Removed externalNativeBuild{cmake{path...}} block: "
+                "AGP will not create any CMake tasks")
+          PY
+          python3 /tmp/disable_cmake.py
+
+      # ------------------------------------------------------------
+      # 12. Сборка APK — CMake-таски больше не существуют (см. шаг
+      #     выше), так что пересборка нативки физически невозможна,
+      #     -x тут больше не нужен и не нужна не-существующая задача.
       # ------------------------------------------------------------
       - name: Build Debug APK
         shell: bash
         run: |
           set -euo pipefail
-          # IMPORTANT: ubuntu-latest runners ship a preinstalled NDK, so the
-          # externalNativeBuild task configured in TMessagesProj/build.gradle
-          # would otherwise run unconditionally as part of assembling
-          # TMessagesProj_App (which depends on the TMessagesProj library) —
-          # silently rebuilding native code from source and discarding the
-          # prebuilt/verified .so we just installed into jniLibs above.
-          # Exclude it explicitly so the prebuilt binaries are what actually
-          # ends up in the APK.
           ./gradlew \
             :TMessagesProj_App:assembleDebug \
-            -x externalNativeBuildDebug \
             --no-daemon \
             --stacktrace \
             --max-workers=2
@@ -358,8 +403,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Belt-and-suspenders: fail loudly if a native build task somehow
-          # still ran, instead of silently shipping a re-built .so.
+          # Belt-and-suspenders: with the externalNativeBuild{cmake{path...}}
+          # block removed above, TMessagesProj/build/intermediates/cxx should
+          # never even be created. Fail loudly if it somehow appears anyway,
+          # instead of silently shipping a re-built .so.
           if [ -d TMessagesProj/build/intermediates/cxx ] && \
              find TMessagesProj/build/intermediates/cxx -name "*.so" -newer .ci/native/telegram-native-arm64.zip 2>/dev/null | grep -q .; then
             echo "ERROR: native code was rebuilt on this runner instead of using the prebuilt .so"
