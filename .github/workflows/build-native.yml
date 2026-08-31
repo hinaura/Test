@@ -1,0 +1,253 @@
+# .github/workflows/build-native.yml
+#
+# Собирает ТОЛЬКО нативную часть Telegram (arm64-v8a .so) через NDK.
+# Java/Gradle APK здесь не собирается вообще.
+#
+# Результат:
+#   - artifact "telegram-native-arm64" с .so файлами
+#   - (опционально) прикрепляется к GitHub Release, чтобы
+#     build-java.yml мог скачать его в отдельном, независимом запуске.
+
+name: Build Telegram Native (.so)
+
+on:
+  workflow_dispatch:
+    inputs:
+      telegram_ref:
+        description: "Telegram commit/tag/branch"
+        required: true
+        default: "master"
+      publish_release:
+        description: "Опубликовать .so как GitHub Release asset"
+        type: boolean
+        required: false
+        default: true
+
+  push:
+    branches:
+      - master
+    paths:
+      # Пересобираем нативку только если тронуты C/C++ исходники
+      # или сам этот workflow.
+      - "TMessagesProj/jni/**"
+      - ".github/workflows/build-native.yml"
+
+concurrency:
+  group: build-native-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write   # нужно для upload release asset; если publish_release=false, можно поставить read
+
+env:
+  # Подтверждено по TMessagesProj/build.gradle (android.ndkVersion) —
+  # актуально на момент проверки для DrKLO/Telegram master.
+  NDK_VERSION: "27.2.12479018"
+  ANDROID_SDK_VERSION: "35"      # android.compileSdkVersion в build.gradle
+  BUILD_TOOLS_VERSION: "35.0.0"  # android.buildToolsVersion в build.gradle
+
+jobs:
+  build-native:
+    name: Build native .so (arm64-v8a)
+    runs-on: ubuntu-latest
+
+    outputs:
+      telegram_sha: ${{ steps.resolve.outputs.sha }}
+
+    steps:
+      # ------------------------------------------------------------
+      # 1. Место на диске — тут не так критично, как в Java-сборке,
+      #    но NDK + toolchain тоже весят прилично.
+      # ------------------------------------------------------------
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 1024
+          swap-size-mb: 4096
+          remove-dotnet: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+          remove-docker-images: "true"
+
+      # ------------------------------------------------------------
+      # 2. Checkout Telegram + submodules (нужны реальные исходники
+      #    C/C++, submodules полностью, а не shallow-заглушка).
+      # ------------------------------------------------------------
+      - name: Checkout Telegram
+        uses: actions/checkout@v4
+        with:
+          repository: DrKLO/Telegram
+          ref: ${{ inputs.telegram_ref || 'master' }}
+          fetch-depth: 1
+          submodules: false
+
+      - name: Checkout submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+          git submodule sync --recursive
+          git -c protocol.version=2 \
+            submodule update --init --recursive --depth=1
+
+      - name: Resolve commit sha
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Building native for commit: $sha"
+
+      # ------------------------------------------------------------
+      # 3. Java нужна только чтобы Gradle мог вызвать externalNativeBuild
+      #    (ndkBuild/cmake таску), APK мы тут не пакуем.
+      # ------------------------------------------------------------
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Relocate Gradle cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIG_WORKSPACE="${GITHUB_WORKSPACE}/.ci"
+          mkdir -p "$BIG_WORKSPACE/gradle-home" "$BIG_WORKSPACE/tmp"
+          echo "GRADLE_USER_HOME=$BIG_WORKSPACE/gradle-home" >> "$GITHUB_ENV"
+          echo "TMPDIR=$BIG_WORKSPACE/tmp" >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------
+      # 4. Android SDK + NDK.
+      #    Этот раннер — единственное место во всей связке,
+      #    где вообще присутствует NDK.
+      # ------------------------------------------------------------
+      - name: Install Android SDK + NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ANDROID_HOME="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+
+          test -x "$SDKMANAGER"
+
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+
+          "$SDKMANAGER" \
+            "platforms;android-${ANDROID_SDK_VERSION}" \
+            "build-tools;${BUILD_TOOLS_VERSION}" \
+            "platform-tools" \
+            "ndk;${NDK_VERSION}" \
+            "cmake;3.22.1"
+
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------
+      # 5. Собираем только нативную часть.
+      #
+      #    Подтверждено по актуальному TMessagesProj/build.gradle:
+      #    - сборка идёт через CMake (jni/CMakeLists.txt), НЕ через
+      #      старый ndk-build/Android.mk (тот был только для армv7
+      #      много лет назад).
+      #    - buildType "debug" существует в списке как есть, поэтому
+      #      автоматическое имя AGP-таски — externalNativeBuildDebug.
+      #    - продукт-флейворов под ABI нет, ABI фильтруется отдельно
+      #      через ndk.abiFilters (см. шаг 11 build-java.yml) —
+      #      значит CMake соберёт все ABI, если их не ограничить
+      #      явно аргументом ниже.
+      # ------------------------------------------------------------
+      - name: Build native libraries only
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # -Pandroid.injected.build.abi ограничивает CMake-сборку
+          # только arm64-v8a, иначе соберутся все ABI из проекта
+          # (armeabi-v7a/x86/x86_64) впустую.
+          ./gradlew \
+            :TMessagesProj:externalNativeBuildDebug \
+            -Pandroid.injected.build.abi=arm64-v8a \
+            --no-daemon \
+            --stacktrace \
+            --max-workers=2
+
+      # ------------------------------------------------------------
+      # 6. Оставляем только arm64-v8a и проверяем ABI.
+      # ------------------------------------------------------------
+      - name: Collect and validate .so
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SRC_DIR="TMessagesProj/build/intermediates/cxx"
+          OUT_DIR="native-out/arm64-v8a"
+          mkdir -p "$OUT_DIR"
+
+          find "$SRC_DIR" -type f -path "*arm64-v8a*" -name "*.so" -exec cp {} "$OUT_DIR/" \;
+
+          COUNT="$(find "$OUT_DIR" -type f -name '*.so' | wc -l)"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "ERROR: no .so produced — check the externalNativeBuild task name above"
+            exit 1
+          fi
+
+          echo "=== Built libraries ==="
+          find "$OUT_DIR" -type f -name "*.so" -print0 |
+            while IFS= read -r -d '' lib; do
+              echo
+              echo "----- $lib -----"
+              file "$lib"
+              if ! file "$lib" | grep -q "ARM aarch64"; then
+                echo "ERROR: wrong architecture: $lib"
+                exit 1
+              fi
+            done
+
+      # ------------------------------------------------------------
+      # 7. Пакуем + считаем sha256 (для второго workflow).
+      # ------------------------------------------------------------
+      - name: Package native bundle
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd native-out
+          zip -r ../telegram-native-arm64.zip arm64-v8a
+          cd ..
+
+          sha256sum telegram-native-arm64.zip | tee telegram-native-arm64.zip.sha256
+          echo "sha256=$(cut -d' ' -f1 telegram-native-arm64.zip.sha256)" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------
+      # 8. Artifact между jobs/раннерами одного workflow run.
+      # ------------------------------------------------------------
+      - name: Upload native artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: telegram-native-arm64
+          path: |
+            telegram-native-arm64.zip
+            telegram-native-arm64.zip.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+      # ------------------------------------------------------------
+      # 9. (опционально) Публикуем как Release asset — так второй
+      #    workflow сможет забрать бинарник даже в СОВЕРШЕННО
+      #    отдельном запуске, не только в рамках одного run.
+      # ------------------------------------------------------------
+      - name: Publish release asset
+        if: ${{ inputs.publish_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: native-${{ steps.resolve.outputs.sha }}
+          name: "Telegram native arm64 @ ${{ steps.resolve.outputs.sha }}"
+          files: |
+            telegram-native-arm64.zip
+            telegram-native-arm64.zip.sha256
