@@ -339,16 +339,33 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # TMessagesProj is an Android *library* module (com.android.library) —
-          # ":TMessagesProj:assembleDebug" only produces an AAR, never an APK.
-          # The actual application module that packages the APK is
-          # TMessagesProj_App (com.android.application), which depends on
-          # TMessagesProj. Build that instead.
+          # IMPORTANT: ubuntu-latest runners ship a preinstalled NDK, so the
+          # externalNativeBuild task configured in TMessagesProj/build.gradle
+          # would otherwise run unconditionally as part of assembling
+          # TMessagesProj_App (which depends on the TMessagesProj library) —
+          # silently rebuilding native code from source and discarding the
+          # prebuilt/verified .so we just installed into jniLibs above.
+          # Exclude it explicitly so the prebuilt binaries are what actually
+          # ends up in the APK.
           ./gradlew \
             :TMessagesProj_App:assembleDebug \
+            -x externalNativeBuildDebug \
             --no-daemon \
             --stacktrace \
             --max-workers=2
+
+      - name: Confirm no native rebuild happened
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Belt-and-suspenders: fail loudly if a native build task somehow
+          # still ran, instead of silently shipping a re-built .so.
+          if [ -d TMessagesProj/build/intermediates/cxx ] && \
+             find TMessagesProj/build/intermediates/cxx -name "*.so" -newer .ci/native/telegram-native-arm64.zip 2>/dev/null | grep -q .; then
+            echo "ERROR: native code was rebuilt on this runner instead of using the prebuilt .so"
+            exit 1
+          fi
+          echo "OK: no fresh native build artifacts found, prebuilt .so was used"
 
       - name: Verify APK
         shell: bash
