@@ -221,8 +221,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          python3 <<'PY'
+          cat > /tmp/restrict_abi.py <<'PY'
           from pathlib import Path
 
           p = Path("TMessagesProj/build.gradle")
@@ -238,15 +237,12 @@ jobs:
               print("WARNING: minSdk marker not found; ABI filter not inserted")
               raise SystemExit(0)
 
-          replacement = """        minSdkVersion 21
-
-        ndk {
-            abiFilters 'arm64-v8a'
-        }"""
+          replacement = marker + "\n\n        ndk {\n            abiFilters 'arm64-v8a'\n        }"
 
           p.write_text(text.replace(marker, replacement, 1))
           print("Inserted arm64-v8a ABI filter")
           PY
+          python3 /tmp/restrict_abi.py
 
       # ------------------------------------------------------------
       # 9. google-services.json заглушка (как раньше).
