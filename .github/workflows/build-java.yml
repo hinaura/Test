@@ -274,7 +274,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ -f TMessagesProj/google-services.json ]; then
+          if [ -f google-services.json ]; then
             echo "google-services.json already exists"
             exit 0
           fi
@@ -312,7 +312,7 @@ jobs:
               "configuration_version": "1"
           }
 
-          with open("TMessagesProj/google-services.json", "w") as f:
+          with open("google-services.json", "w") as f:
               json.dump(data, f, indent=2)
           PY
 
@@ -339,8 +339,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # TMessagesProj is an Android *library* module (com.android.library) —
+          # ":TMessagesProj:assembleDebug" only produces an AAR, never an APK.
+          # The actual application module that packages the APK is
+          # TMessagesProj_App (com.android.application), which depends on
+          # TMessagesProj. Build that instead.
           ./gradlew \
-            :TMessagesProj:assembleDebug \
+            :TMessagesProj_App:assembleDebug \
             --no-daemon \
             --stacktrace \
             --max-workers=2
@@ -350,9 +355,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          find TMessagesProj/build/outputs/apk -type f -name "*.apk" -print
+          find TMessagesProj_App/build/outputs/apk -type f -name "*.apk" -print
 
-          APK="$(find TMessagesProj/build/outputs/apk -type f -name "*.apk" | head -n 1)"
+          APK="$(find TMessagesProj_App/build/outputs/apk -type f -name "*.apk" | head -n 1)"
           if [ -z "$APK" ]; then
             echo "ERROR: APK not found"
             exit 1
@@ -366,6 +371,6 @@ jobs:
         with:
           name: Telegram-arm64-debug
           path: |
-            TMessagesProj/build/outputs/apk/**/*.apk
+            TMessagesProj_App/build/outputs/apk/**/*.apk
           if-no-files-found: error
           retention-days: 7
