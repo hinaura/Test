@@ -193,23 +193,31 @@ jobs:
           sha256sum -c telegram-native-arm64.zip.sha256
 
       # ------------------------------------------------------------
-      # 7. Распаковываем в jniLibs.
+      # 7. Распаковываем в jni/ (НЕ jniLibs/!).
+      #
+      #    ВАЖНО: TMessagesProj/build.gradle содержит
+      #      sourceSets.main.jniLibs.srcDirs = ['./jni/']
+      #    то есть Gradle ищет prebuilt .so именно в jni/<abi>/,
+      #    а не в стандартной папке jniLibs/<abi>/. Из-за этого
+      #    предыдущая версия клала .so в игнорируемое место, и
+      #    mergeDebugNativeLibs находил NO-SOURCE — в APK попадал
+      #    только .so из сторонней AAR-зависимости (ML Kit), а не
+      #    наш libtmessages.so.
       # ------------------------------------------------------------
       - name: Install prebuilt JNI libraries
         shell: bash
         run: |
           set -euo pipefail
 
-          DEST="$GITHUB_WORKSPACE/TMessagesProj/jniLibs"
-          rm -rf "$DEST"
+          DEST="$GITHUB_WORKSPACE/TMessagesProj/jni"
           mkdir -p "$DEST"
 
           unzip -q ".ci/native/telegram-native-arm64.zip" -d "$DEST"
 
           echo "=== Native libraries ==="
-          find "$DEST" -type f -name "*.so" -print | sort
+          find "$DEST" -maxdepth 2 -type f -name "*.so" -print | sort
 
-          COUNT="$(find "$DEST" -type f -name "*.so" | wc -l)"
+          COUNT="$(find "$DEST" -maxdepth 2 -type f -name "*.so" | wc -l)"
           if [ "$COUNT" -eq 0 ]; then
             echo "ERROR: no .so files found"
             exit 1
@@ -219,14 +227,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ABI_DIR="$GITHUB_WORKSPACE/TMessagesProj/jniLibs/arm64-v8a"
+          ABI_DIR="$GITHUB_WORKSPACE/TMessagesProj/jni/arm64-v8a"
 
           if [ ! -d "$ABI_DIR" ]; then
             echo "ERROR: arm64-v8a directory is missing"
             exit 1
           fi
 
-          find "$ABI_DIR" -type f -name "*.so" -print0 |
+          find "$ABI_DIR" -maxdepth 1 -type f -name "*.so" -print0 |
             while IFS= read -r -d '' lib; do
               echo "----- $lib -----"
               file "$lib"
@@ -238,31 +246,43 @@ jobs:
 
       # ------------------------------------------------------------
       # 8. Только arm64-v8a в APK.
+      #
+      #    ВАЖНО: patch должен идти именно в TMessagesProj_App —
+      #    там объявлен flavor "afat" с
+      #      abiFilters "armeabi-v7a", "arm64-v8a", "x86", "x86_64"
+      #    Патч TMessagesProj/build.gradle (библиотеки) НЕ влияет на
+      #    финальную паковку APK — отсюда все 4 ABI-папки в готовом
+      #    APK, даже когда мы сами собрали только arm64-v8a .so.
       # ------------------------------------------------------------
       - name: Restrict APK to arm64-v8a
         shell: bash
         run: |
           set -euo pipefail
           cat > /tmp/restrict_abi.py <<'PY'
+          import re
           from pathlib import Path
 
-          p = Path("TMessagesProj/build.gradle")
+          p = Path("TMessagesProj_App/build.gradle")
           text = p.read_text()
 
-          if "abiFilters 'arm64-v8a'" in text or 'abiFilters "arm64-v8a"' in text:
-              print("arm64-v8a already configured")
-              raise SystemExit(0)
+          # Заменяем ЛЮБОЙ abiFilters "..." , "..." (2-4 значения,
+          # во всех product flavor блоках: afat, bundleAfat, и т.д.)
+          # на единственный arm64-v8a.
+          pattern = re.compile(r'abiFilters\s+((?:"[^"]+"\s*,\s*)*"[^"]+")')
 
-          marker = "        minSdkVersion 21"
+          def repl(m):
+              return 'abiFilters "arm64-v8a"'
 
-          if marker not in text:
-              print("WARNING: minSdk marker not found; ABI filter not inserted")
-              raise SystemExit(0)
+          new_text, count = pattern.subn(repl, text)
 
-          replacement = marker + "\n\n        ndk {\n            abiFilters 'arm64-v8a'\n        }"
+          if count == 0:
+              raise SystemExit(
+                  "ERROR: no abiFilters entries found in TMessagesProj_App/build.gradle "
+                  "-- Telegram's build script layout changed, update this step"
+              )
 
-          p.write_text(text.replace(marker, replacement, 1))
-          print("Inserted arm64-v8a ABI filter")
+          p.write_text(new_text)
+          print(f"Restricted {count} abiFilters block(s) in TMessagesProj_App to arm64-v8a")
           PY
           python3 /tmp/restrict_abi.py
 
